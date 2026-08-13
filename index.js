@@ -1,6 +1,8 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal');
+const QRCode = require('qrcode');
+const http = require('http');
 const pino = require('pino');
 const path = require('path');
 
@@ -11,8 +13,57 @@ const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let sock = null;
+let currentQRCodeDataURL = '';
 
-// Format Egyptian phone number to WhatsApp international JID
+// HTTP Server to display clear QR Code on web page
+const PORT = process.env.PORT || 3000;
+const server = http.createServer(async (req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  if (sock && sock.user) {
+    res.end(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Wasla WhatsApp Bot</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+      <body style="font-family: Arial; text-align: center; padding: 50px; background: #f0f2f5;">
+        <h1 style="color: #25D366;">🟢 Wasla WhatsApp Bot is ONLINE & CONNECTED!</h1>
+        <p style="font-size: 18px;">Connected Number: <b>${sock.user.id.split(':')[0]}</b></p>
+      </body>
+      </html>
+    `);
+  } else if (currentQRCodeDataURL) {
+    res.end(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Scan QR Code - Wasla Bot</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+      <body style="font-family: Arial; text-align: center; padding: 30px; background: #f0f2f5;">
+        <h2 style="color: #075E54;">📱 Scan QR Code with WhatsApp Business (01017323187)</h2>
+        <div style="background: white; display: inline-block; padding: 20px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.1);">
+          <img src="${currentQRCodeDataURL}" width="300" height="300" style="border: 2px solid #25D366; border-radius: 10px;" />
+        </div>
+        <p style="color: #666; margin-top: 15px;">Open WhatsApp -> Linked Devices -> Scan QR Code</p>
+        <script>setTimeout(() => location.reload(), 10000);</script>
+      </body>
+      </html>
+    `);
+  } else {
+    res.end(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Wasla Bot Starting...</title><meta charset="utf-8"></head>
+      <body style="font-family: Arial; text-align: center; padding: 50px;">
+        <h2>🔄 Starting Wasla WhatsApp Bot... Please refresh in 5 seconds.</h2>
+        <script>setTimeout(() => location.reload(), 5000);</script>
+      </body>
+      </html>
+    `);
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`🌐 Web interface active on port ${PORT}`);
+});
+
+// Format Egyptian phone number
 function formatWhatsAppNumber(phone) {
   if (!phone) return null;
   let cleaned = phone.replace(/[^0-9]/g, '');
@@ -26,7 +77,7 @@ function formatWhatsAppNumber(phone) {
   return `${cleaned}@s.whatsapp.net`;
 }
 
-// Function to send WhatsApp order notification to merchant
+// Send WhatsApp Notification
 async function sendOrderNotification(order) {
   if (!sock) {
     console.error('[WhatsApp] Connection offline, cannot send notification for order:', order.id);
@@ -95,7 +146,7 @@ async function sendOrderNotification(order) {
   }
 }
 
-// Connect Baileys WhatsApp Client
+// Connect Baileys Client
 async function connectToWhatsApp() {
   const authDir = path.join(__dirname, 'auth_info_baileys');
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
@@ -109,17 +160,21 @@ async function connectToWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      try {
+        currentQRCodeDataURL = await QRCode.toDataURL(qr);
+      } catch (e) {}
       console.log('\n==================================================');
       console.log('Scan the QR Code below using WhatsApp Business (01017323187):');
       console.log('==================================================\n');
-      qrcode.generate(qr, { small: true });
+      qrcodeTerminal.generate(qr, { small: true });
     }
 
     if (connection === 'close') {
+      currentQRCodeDataURL = '';
       const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
       console.log('[WhatsApp] Connection closed. Reconnecting...', shouldReconnect);
       if (shouldReconnect) {
@@ -128,6 +183,7 @@ async function connectToWhatsApp() {
         console.log('[WhatsApp] Logged out. Please scan QR code again.');
       }
     } else if (connection === 'open') {
+      currentQRCodeDataURL = '';
       console.log('\n==================================================');
       console.log('SUCCESS: WhatsApp Business Connected! Bot is ACTIVE & ONLINE.');
       console.log('==================================================\n');
@@ -136,7 +192,7 @@ async function connectToWhatsApp() {
   });
 }
 
-// Listen to new orders in Supabase Realtime
+// Listen to Supabase Realtime
 function startSupabaseListener() {
   console.log('[Supabase] Listening for NEW ORDERS (Realtime)...');
 
