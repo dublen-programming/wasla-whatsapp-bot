@@ -3,6 +3,7 @@ const { createClient } = require('@supabase/supabase-js');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const http = require('http');
+const https = require('https');
 const pino = require('pino');
 const path = require('path');
 
@@ -14,8 +15,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let sock = null;
 let currentQRCodeDataURL = '';
+const processedOrders = new Set(); // لمنع تكرار الإشعارات لنفس الطلب
 
-// HTTP Server to display clear QR Code on web page
+// HTTP Server to display status and clear QR Code
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(async (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -27,6 +29,7 @@ const server = http.createServer(async (req, res) => {
       <body style="font-family: Arial; text-align: center; padding: 50px; background: #f0f2f5;">
         <h1 style="color: #25D366;">🟢 Wasla WhatsApp Bot is ONLINE & CONNECTED!</h1>
         <p style="font-size: 18px;">Connected Number: <b>${sock.user.id.split(':')[0]}</b></p>
+        <p style="color: #666;">Monitoring Supabase Realtime + Auto Polling Active</p>
       </body>
       </html>
     `);
@@ -63,6 +66,20 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Web interface active on port ${PORT}`);
 });
 
+// Self-Ping لمنع السيرفر من النوم على الباقة المجانية
+setInterval(() => {
+  const url = process.env.RENDER_EXTERNAL_URL || 'https://wasla-bot.onrender.com';
+  console.log(`[Keep-Alive] Self-pinging ${url}...`);
+  try {
+    const client = url.startsWith('https') ? https : http;
+    client.get(url, (res) => {
+      console.log(`[Keep-Alive] Ping response status: ${res.statusCode}`);
+    }).on('error', (err) => {
+      console.log(`[Keep-Alive] Ping error: ${err.message}`);
+    });
+  } catch (e) {}
+}, 5 * 60 * 1000); // كل 5 دقائق
+
 // Format Egyptian phone number
 function formatWhatsAppNumber(phone) {
   if (!phone) return null;
@@ -79,8 +96,14 @@ function formatWhatsAppNumber(phone) {
 
 // Send WhatsApp Notification
 async function sendOrderNotification(order) {
-  if (!sock) {
-    console.error('[WhatsApp] Connection offline, cannot send notification for order:', order.id);
+  if (!order || !order.id) return;
+  
+  if (processedOrders.has(String(order.id))) {
+    return; // تلافي تكرار الإرسال
+  }
+  
+  if (!sock || !sock.user) {
+    console.error('[WhatsApp] Offline, holding notification for order:', order.id);
     return;
   }
 
@@ -139,10 +162,35 @@ async function sendOrderNotification(order) {
     console.log(`[WhatsApp] Sending notification to "${shop.name}" (${merchantPhone})...`);
 
     await sock.sendMessage(recipientJid, { text: messageText });
+    processedOrders.add(String(order.id));
     console.log(`[SUCCESS] WhatsApp notification sent for Order #${orderIdShort}!`);
 
   } catch (e) {
     console.error('[ERROR] Failed to send WhatsApp notification:', e);
+  }
+}
+
+// Polling Backup: فحص دوري للطلبات الأخيرة كل 20 ثانية للتأكد من عدم تفويت أي طلب
+async function checkRecentOrders() {
+  if (!sock || !sock.user) return;
+  try {
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const { data: recentOrders, error } = await supabase
+      .from('orders')
+      .select('*')
+      .gte('created_at', tenMinutesAgo)
+      .order('created_at', { ascending: false });
+
+    if (!error && recentOrders && recentOrders.length > 0) {
+      for (const order of recentOrders) {
+        if (!processedOrders.has(String(order.id))) {
+          console.log(`[Polling] Found recent unnotified order #${order.id}, sending...`);
+          await sendOrderNotification(order);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[Polling] Error checking recent orders:', e);
   }
 }
 
@@ -188,6 +236,8 @@ async function connectToWhatsApp() {
       console.log('SUCCESS: WhatsApp Business Connected! Bot is ACTIVE & ONLINE.');
       console.log('==================================================\n');
       startSupabaseListener();
+      checkRecentOrders();
+      setInterval(checkRecentOrders, 20 * 1000); // استطلاع تكميلي كل 20 ثانية
     }
   });
 }
